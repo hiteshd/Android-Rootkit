@@ -25,8 +25,8 @@ description:    This rookit is developed to intercept the following calls
  						 SYS_GETDENT ,SYS_UNLINK, SYS_KILL 
  						 						
 author:         Hitesh Dharmdasani <hdharmda@gmu.edu>
-license:        GPL
-depends:        
+license:        GPL v2
+depends:        Android NDK, Kernel source tree of target
 vermagic:       2.6.38.8-cos-bravo-jellybean+ preempt mod_unload ARMv7 
 
 
@@ -38,3 +38,9 @@ Other details
   -- Fix entry in utrelease.h
   -- Fix entry in kernel.release
   -- DO NOT 'make' the kernel source tree after you do this
+* Edit the makefile to suit your paths for the NDK and the kernel source tree for your Android Operating system
+* The rootkit compiles as a kernel object and needs to be run on the phone. 
+		# insmod sys_call_table.ko
+  		# ./sys_call_table_inst
+* Use `dmesg` to debug
+
